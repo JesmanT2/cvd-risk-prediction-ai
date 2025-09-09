@@ -8,6 +8,162 @@ import requests
 import json
 from datetime import datetime
 import os
+import pytesseract
+from PIL import Image
+import io
+import base64
+from pdf2image import convert_from_bytes
+import openai
+from openai import OpenAI
+
+# Set Tesseract Path (Update this path to match your Tesseract installation)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# Medical Report Processing Functions
+def extract_text_from_image(image):
+    """Extract text from image using OCR"""
+    try:
+        # Try to get Tesseract version to check installation
+        try:
+            tesseract_version = pytesseract.get_tesseract_version()
+            st.success(f"✅ Tesseract OCR version {tesseract_version} found")
+        except Exception as e:
+            st.error(f"""
+            ❌ Tesseract OCR error: {str(e)}
+            
+            Please ensure Tesseract is installed and properly configured:
+            1. Download Tesseract installer from: https://github.com/UB-Mannheim/tesseract/wiki
+            2. Install it in the default location (C:\\Program Files\\Tesseract-OCR)
+            3. If installed in a different location, update the path in the code
+            4. Restart the application
+            
+            Current expected path: {pytesseract.pytesseract.tesseract_cmd}
+            """)
+            return None
+            
+        # Prepare image for better OCR
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Extract text
+        text = pytesseract.image_to_string(image)
+        
+        if not text or len(text.strip()) < 5:
+            st.warning("⚠️ No text was detected in the image. Please ensure the image is clear and contains readable text.")
+            return None
+            
+        return text
+    except Exception as e:
+        st.error(f"Error in OCR processing: {str(e)}")
+        return None
+
+def process_medical_report(file_content, file_type):
+    """Process uploaded medical report file"""
+    try:
+        if file_type.startswith('image/'):
+            image = Image.open(io.BytesIO(file_content))
+            text = extract_text_from_image(image)
+        elif file_type == 'application/pdf':
+            images = convert_from_bytes(file_content)
+            text = ""
+            for image in images:
+                text += extract_text_from_image(image) + "\n"
+        else:
+            text = file_content.decode('utf-8')
+        return text
+    except Exception as e:
+        st.error(f"Error processing file: {str(e)}")
+        return None
+
+def interpret_medical_report(text):
+    """Interpret medical report using OpenAI API"""
+    if not text or len(text.strip()) < 10:
+        st.error("Not enough text was extracted from the image. Please ensure the image is clear and contains readable text.")
+        return None
+        
+    prompt = f"""
+    Below is a medical report. Please:
+    1. Summarize the key findings in simple, non-technical language
+    2. Highlight any concerning areas that need attention
+    3. Suggest next steps or lifestyle changes based on the results
+    4. Indicate if any immediate medical attention is needed
+
+    Medical Report:
+    {text}
+    """
+
+    try:
+        # Get API key from secrets
+        api_key = st.secrets.get("OPENAI_API_KEY")
+        if not api_key:
+            st.error("""
+            ⚠️ OpenAI API key not found! Please follow these steps:
+            1. Go to https://platform.openai.com/api-keys
+            2. Sign in or create an account
+            3. Set up billing information
+            4. Create a new API key
+            5. Add it to .streamlit/secrets.toml as: OPENAI_API_KEY = "your-key-here"
+            """)
+            return None
+            
+        # Initialize OpenAI client
+        client = openai.OpenAI(api_key=api_key)
+        
+        # Show a warning about billing setup if needed
+        st.info("""
+        ℹ️ If you're getting rate limit errors, please ensure you have:
+        1. Set up billing information in your OpenAI account
+        2. Verified your email address
+        3. Added a valid payment method
+        
+        Visit: https://platform.openai.com/account/billing
+        """)
+        
+        # Make API call with retries
+        import time
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful medical assistant that explains medical reports in simple terms. Always remind users to consult healthcare professionals for medical advice."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7,
+                    max_tokens=1000
+                )
+                break  # If successful, break the retry loop
+            except openai.RateLimitError:
+                if attempt < max_retries - 1:  # If not the last attempt
+                    st.warning(f"Rate limit hit. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    raise  # Re-raise the error if all retries failed
+
+        # Extract and return the interpretation
+        interpretation = response.choices[0].message.content
+        return interpretation
+        
+    except openai.AuthenticationError:
+        st.error("Authentication error: Please check your OpenAI API key.")
+        return None
+    except openai.RateLimitError:
+        st.error("Rate limit exceeded: Please try again later.")
+        return None
+    except openai.APIError as e:
+        st.error(f"OpenAI API error: {str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"Error interpreting report: {str(e)}")
+        return None
 
 try:
     # Page configuration
@@ -17,7 +173,79 @@ try:
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    st.write("Page configuration loaded successfully")
+    
+    # Add tabs for different functionalities
+    tab1, tab2 = st.tabs(["Risk Assessment", "Medical Report Analysis"])
+    
+    with tab2:
+        st.header("📋 Medical Report Analysis")
+        st.markdown("""
+        Upload your medical report or take a picture to get an AI-powered interpretation 
+        in simple terms. Supported formats: PDF, Images (JPG, PNG), and Text files.
+        """)
+        
+        # File upload and camera input
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            uploaded_file = st.file_uploader("Upload Medical Report", 
+                type=['pdf', 'png', 'jpg', 'jpeg', 'txt'],
+                help="Upload your medical report file")
+        
+        with col2:
+            st.markdown("### 📸 Camera Input")
+            camera_enabled = st.button("📸 Turn On Camera", 
+                help="Click to enable camera capture",
+                use_container_width=True)
+            
+            if camera_enabled:
+                camera_input = st.camera_input("Take a picture of your report",
+                    help="Use your camera to take a picture of your medical report")
+                if camera_input is not None:
+                    st.success("✅ Image captured successfully!")
+            else:
+                camera_input = None
+                st.info("Click the button above to enable camera capture")
+        
+        if uploaded_file is not None:
+            with st.spinner("Processing your medical report..."):
+                # Process uploaded file
+                file_content = uploaded_file.read()
+                file_type = uploaded_file.type
+                
+                # Extract text from the file
+                extracted_text = process_medical_report(file_content, file_type)
+                
+                if extracted_text:
+                    # Get AI interpretation
+                    interpretation = interpret_medical_report(extracted_text)
+                    
+                    if interpretation:
+                        st.markdown("### 🤖 AI Interpretation")
+                        st.markdown(interpretation)
+                        st.info("⚕️ Remember: This AI interpretation is for informational purposes only. Always consult with healthcare professionals for medical advice.")
+        
+        elif camera_input is not None:
+            with st.spinner("Processing your medical report..."):
+                # Process camera input
+                file_content = camera_input.getvalue()
+                file_type = camera_input.type
+                
+                # Extract text from the image
+                extracted_text = process_medical_report(file_content, file_type)
+                
+                if extracted_text:
+                    # Get AI interpretation
+                    interpretation = interpret_medical_report(extracted_text)
+                    
+                    if interpretation:
+                        st.markdown("### 🤖 AI Interpretation")
+                        st.markdown(interpretation)
+                        st.info("⚕️ Remember: This AI interpretation is for informational purposes only. Always consult with healthcare professionals for medical advice.")
+    
+    # Original content goes in tab1
+    with tab1:
+        st.write("Page configuration loaded successfully")
 except Exception as e:
     st.error(f"Error in page configuration: {str(e)}")
 
@@ -30,17 +258,26 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
         font-weight: bold;
+        text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
     }
     .subtitle {
         font-size: 1.2rem;
-        color: var(--text-color, #34495e);
+        color: #000000;
         text-align: center;
         margin-bottom: 3rem;
         font-style: italic;
+        font-weight: 500;
     }
     /* Dark mode text color */
     [data-theme="dark"] {
-        --text-color: #f1f1f1;
+        --text-color: #ffffff;
+    }
+    /* Ensure all text has good contrast */
+    body {
+        color: #000000 !important;
+    }
+    [data-theme="dark"] body {
+        color: #ffffff !important;
     }
     .prediction-box {
         padding: 1.5rem;
@@ -51,14 +288,20 @@ st.markdown("""
     .high-risk {
         background: linear-gradient(135deg, #ffebee 0%, #ffcdd2 100%);
         border-left: 5px solid #f44336;
+        color: #3d0000 !important;
     }
     .medium-risk {
         background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
         border-left: 5px solid #ff9800;
+        color: #3d2200 !important;
     }
     .low-risk {
         background: linear-gradient(135deg, #e8f5e8 0%, #c8e6c9 100%);
         border-left: 5px solid #4caf50;
+        color: #002600 !important;
+    }
+    .high-risk *, .medium-risk *, .low-risk * {
+        color: inherit !important;
     }
     .llm-advice {
         background: rgba(33, 150, 243, 0.1);
@@ -69,12 +312,33 @@ st.markdown("""
         color: var(--text-color, inherit) !important;
     }
     .feature-card {
-        background: rgba(255, 255, 255, 0.05);
+        background: rgba(255, 255, 255, 0.9);
         padding: 1rem;
         border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-        color: var(--text-color, inherit) !important;
+        color: #000000 !important;
         margin: 0.5rem 0;
+    }
+    [data-theme="dark"] .feature-card {
+        background: rgba(30, 30, 30, 0.9);
+        color: #ffffff !important;
+    }
+    /* Camera button styling */
+    .stButton > button {
+        background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+        color: white;
+        font-weight: 600;
+        padding: 0.75rem 1.5rem;
+        border: none;
+        border-radius: 10px;
+        transition: all 0.3s ease;
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    .stButton > button:active {
+        transform: translateY(0);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -90,6 +354,65 @@ def load_model():
     except FileNotFoundError:
         st.error("❌ Model file not found. Please ensure 'heart_disease_model.pkl' is in the app directory.")
         return None, None, None
+
+def extract_text_from_image(image):
+    """Extract text from image using OCR"""
+    try:
+        text = pytesseract.image_to_string(image)
+        return text
+    except Exception as e:
+        st.error(f"Error in OCR processing: {str(e)}")
+        return None
+
+def process_medical_report(file_content, file_type):
+    """Process uploaded medical report file"""
+    try:
+        if file_type.startswith('image/'):
+            image = Image.open(io.BytesIO(file_content))
+            text = extract_text_from_image(image)
+        elif file_type == 'application/pdf':
+            images = convert_from_bytes(file_content)
+            text = ""
+            for image in images:
+                text += extract_text_from_image(image) + "\n"
+        else:
+            text = file_content.decode('utf-8')
+        return text
+    except Exception as e:
+        st.error(f"Error processing file: {str(e)}")
+        return None
+
+def interpret_medical_report(text):
+    """Interpret medical report using OpenAI API"""
+    try:
+        openai.api_key = st.secrets["OPENAI_API_KEY"]
+        
+        prompt = f"""
+        Below is a medical report. Please:
+        1. Summarize the key findings in simple, non-technical language
+        2. Highlight any concerning areas that need attention
+        3. Suggest next steps or lifestyle changes based on the results
+        4. Indicate if any immediate medical attention is needed
+
+        Medical Report:
+        {text}
+        """
+
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful medical assistant that explains medical reports in simple terms. Always remind users to consult healthcare professionals for medical advice."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+
+        interpretation = response.choices[0].message.content
+        return interpretation
+    except Exception as e:
+        st.error(f"Error interpreting report: {str(e)}")
+        return None
 
 # LLM Integration Functions
 class LLMHealthCoach:
